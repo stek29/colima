@@ -3,6 +3,7 @@ package configmanager
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"strings"
 
@@ -97,11 +98,40 @@ func ValidateConfig(c config.Config) error {
 			return err
 		}
 	}
+	if err := validateNetworkSubnet(c); err != nil {
+		return err
+	}
 
 	if err := validateMounts(c.Mounts); err != nil {
 		return err
 	}
 
+	return nil
+}
+
+func validateNetworkSubnet(c config.Config) error {
+	if c.Network.Subnet == "" {
+		return nil
+	}
+	prefix, err := netip.ParsePrefix(c.Network.Subnet)
+	if err != nil {
+		return fmt.Errorf("invalid network subnet %q: %w", c.Network.Subnet, err)
+	}
+	if !prefix.Addr().Is4() {
+		return fmt.Errorf("network subnet %q is not IPv4", c.Network.Subnet)
+	}
+	if prefix.Bits() > 30 {
+		return fmt.Errorf("network subnet %q must contain at least two usable addresses", c.Network.Subnet)
+	}
+	if prefix != prefix.Masked() {
+		return fmt.Errorf("network subnet %q must use network address %q", c.Network.Subnet, prefix.Masked())
+	}
+	if c.Network.Mode != "shared" {
+		return fmt.Errorf("network subnet is only supported with shared network mode")
+	}
+	if c.VMType == "vz" {
+		return fmt.Errorf("network subnet is not supported with vmType 'vz'")
+	}
 	return nil
 }
 

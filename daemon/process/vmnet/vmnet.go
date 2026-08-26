@@ -2,8 +2,10 @@ package vmnet
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,20 +24,29 @@ const (
 
 	NetGateway = "192.168.106.1"
 	NetDHCPEnd = "192.168.106.254"
+	NetMask    = "255.255.255.0"
 )
 
 var _ process.Process = (*vmnetProcess)(nil)
 
-func New(mode, netInterface string) process.Process {
+func New(mode, netInterface string, subnet Subnet) process.Process {
 	return &vmnetProcess{
 		mode:         mode,
 		netInterface: netInterface,
+		subnet:       subnet,
 	}
+}
+
+type Subnet struct {
+	Gateway string
+	DHCPEnd string
+	Netmask string
 }
 
 type vmnetProcess struct {
 	mode         string
 	netInterface string
+	subnet       Subnet
 }
 
 func (*vmnetProcess) Alive(ctx context.Context) error {
@@ -95,8 +106,9 @@ func (v *vmnetProcess) Start(ctx context.Context) error {
 			command = cli.CommandInteractive("sudo", BinaryPath,
 				"--vmnet-mode", "shared",
 				"--socket-group", "staff",
-				"--vmnet-gateway", NetGateway,
-				"--vmnet-dhcp-end", NetDHCPEnd,
+				"--vmnet-gateway", v.subnet.Gateway,
+				"--vmnet-dhcp-end", v.subnet.DHCPEnd,
+				"--vmnet-mask", v.subnet.Netmask,
 				"--pidfile", pid,
 				socket,
 			)
@@ -122,6 +134,43 @@ func (v *vmnetProcess) Start(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func ParseSubnet(value string) (Subnet, error) {
+	if value == "" {
+		return Subnet{
+			Gateway: NetGateway,
+			DHCPEnd: NetDHCPEnd,
+			Netmask: NetMask,
+		}, nil
+	}
+
+	prefix, err := netip.ParsePrefix(value)
+	if err != nil {
+		return Subnet{}, fmt.Errorf("invalid network subnet %q: %w", value, err)
+	}
+	if !prefix.Addr().Is4() {
+		return Subnet{}, fmt.Errorf("network subnet %q is not IPv4", value)
+	}
+	if prefix.Bits() > 30 {
+		return Subnet{}, fmt.Errorf("network subnet %q must contain at least two usable addresses", value)
+	}
+	if prefix != prefix.Masked() {
+		return Subnet{}, fmt.Errorf("network subnet %q must use network address %q", value, prefix.Masked())
+	}
+
+	addr := prefix.Addr().As4()
+	first := binary.BigEndian.Uint32(addr[:])
+	hostMask := uint32(1)<<(32-prefix.Bits()) - 1
+	var gateway, dhcpEnd [4]byte
+	binary.BigEndian.PutUint32(gateway[:], first+1)
+	binary.BigEndian.PutUint32(dhcpEnd[:], first+hostMask-1)
+
+	return Subnet{
+		Gateway: netip.AddrFrom4(gateway).String(),
+		DHCPEnd: netip.AddrFrom4(dhcpEnd).String(),
+		Netmask: net.IP(net.CIDRMask(prefix.Bits(), 32)).String(),
+	}, nil
 }
 
 func (vmnetProcess) Dependencies() (deps []process.Dependency, root bool) {
